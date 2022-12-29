@@ -142,9 +142,14 @@ fn is_component (mut module_name: &str, file_name: &str, relative_file_path: &st
     if(module_name.contains("as")){
         module_name = module_name.split("as").nth(0).unwrap().trim();
     }
+    let module_references: Vec<&str> = content.matches(module_name).collect();
+
     let print_status = module_name == "ProfileOptions";
     let mut return_value = true;
     // let component_usage_identifier = Regex::new(format!(r".*<{module_name}").as_str()).unwrap();
+    if module_references.len() < 2 {
+        return_value = false
+    } 
     if module_name == "" || relative_file_path == "" {
         return_value = false
     }
