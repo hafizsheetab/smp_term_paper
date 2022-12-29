@@ -5,40 +5,18 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::cell::Ref;
 pub mod types;
-use types::component;
+pub mod htmltopdf;
+use types::ReactComponent;
 pub fn run(args: &Vec<String>) {
     let path = args[1].clone();
+    let name = args[0].as_str();
     let mut path = path.replace("\\", "/");
     println!("This is the Root path of App.js: {}", &path);
     let component =build_component("App", Path::new(&path), "App").unwrap();
     let ref_component = RefCell::new(component);
-    print_component(ref_component.borrow());
+    htmltopdf::build_html(ref_component.borrow(), name)
 }
-pub fn print_component(component: Ref<component>) {
-    println!("Parent: {}", component.name());
-    
-    let children = component.children();
-    if(children.len() > 0){
-        print!("Children: ");
-    }
-    for child in children{
-        let name = child.borrow().name().to_owned();
-        print!("{}, ",&name);
 
-    }
-    println!("");
-    for child in children {
-        let name = child.borrow().name().to_owned();
-        println!("Recursive Call from {} to {}", component.name(), name);
-        print_component(child.borrow());
-    }
-
-}
-pub fn unwrap<T>(last_elem: Rc<RefCell<T>>) -> T {
-    let inner: RefCell<T> = Rc::try_unwrap(last_elem)
-        .unwrap_or_else(|_| panic!("The last_elem was shared, failed to unwrap"));
-    inner.into_inner()
-}
 // pub fn build_component_tree( path: &String) {
 //     let mut child_path = path.clone();
 //     child_path.push_str("App.js");
@@ -56,9 +34,9 @@ pub fn build_component(
     name: &str,
     mut dir_path: &Path,
     module_name: &str
-) -> Option<component> {
-    println!("=-=-=-=-=-=- First {} {} {}", name, dir_path.display(), module_name);
-    let mut component = component::new(name, dir_path.canonicalize().unwrap().as_os_str().to_str().unwrap());
+) -> Option<ReactComponent> {
+    //println!("=-=-=-=-=-=- First {} {} {}", name, dir_path.display(), module_name);
+    let mut component = ReactComponent::new(name, dir_path.canonicalize().unwrap().as_os_str().to_str().unwrap());
     let (mut file_name, found) = get_file_name(name, dir_path);
     let mut corrected_relative_file_path = String::from("./");
     if(!found){
@@ -73,13 +51,24 @@ pub fn build_component(
 
     }
     let content = fs::read_to_string(Path::new(&dir_path).join(&corrected_relative_file_path).join(&file_name)).expect("Should Read File");
+    let number_of_state_variables: Vec<&str> = content.matches("useState").collect();
+    let number_of_effect_dependency: Vec<&str> = content.matches("useEffect").collect();
+    let number_of_ref_dependency: Vec<&str> = content.matches("useRef").collect();
+    let number_of_memos: Vec<&str> = content.matches("useMemo").collect();
+    let number_of_context_usages: Vec<&str> = content.matches("useContext").collect();
+    let number_of_reducers: Vec<&str> = content.matches("useReducer").collect();
+    component.incr_component_internal_dependency(calculate_component_internal_dependency((&number_of_state_variables, &number_of_effect_dependency, &number_of_ref_dependency, &number_of_memos, &number_of_context_usages, &number_of_reducers)));
     let lines_with_imports = search("import,from", &content.lines().collect(), false);
     let lines_with_curly_braces = search("{, }", &lines_with_imports, false);
     for line in & lines_with_curly_braces {
         let  (module_names,  file_name,  relative_file_path,  relative_file_dir) = get_module_name_and_path_from_line(line, true);
         let module_names: Vec<&str> = module_names.split(",").collect();
+        if(is_module(&relative_file_dir)){
+            component.incr_external_module_dependency(1)
+        }
         for module_name in module_names {
            if is_component(module_name.trim(), &file_name, &relative_file_path, &relative_file_dir, &content){
+            component.incr_external_component_dependency(1);
             let child_path = dir_path.join(&corrected_relative_file_path).join(&relative_file_dir);
             if let Some(child_component) = build_component(
                 &file_name,
@@ -90,12 +79,19 @@ pub fn build_component(
                 component.add_child(Rc::new(RefCell::new(child_component)))
             }
            }
+           else if !is_module(&relative_file_dir) && !path_contains_extension(&relative_file_path){
+            component.incr_external_interface_dependency(1)
+        }  
         }
     }
     let lines_without_curly_braces = search("{, }", &lines_with_imports, true);
     for line in &lines_without_curly_braces {   
         let  (module_name,  file_name,  relative_file_path,  relative_file_dir) = get_module_name_and_path_from_line(line, false);
+        if(is_module(&relative_file_dir)){
+            component.incr_external_module_dependency(1);
+        }
         if is_component(&module_name, &file_name, &relative_file_path, &relative_file_dir, &content){
+            component.incr_external_component_dependency(1);
             let child_path = dir_path.join(&corrected_relative_file_path).join(&relative_file_dir);
             if let Some(child_component) = build_component(
                 &file_name,
@@ -105,49 +101,76 @@ pub fn build_component(
 
                 component.add_child(Rc::new(RefCell::new(child_component)))
             }
+        }
+        else if !is_module(&relative_file_dir)  && !path_contains_extension(&relative_file_path){
+            component.incr_external_interface_dependency(1)
         }      
         
     }
     Some(component)
 }
-fn is_component (module_name: &str, file_name: &str, relative_file_path: &str, relative_file_dir: &str, content: &str) -> bool {
+
+fn calculate_component_internal_dependency(dependencies: (&Vec<&str>,&Vec<&str>,&Vec<&str>,&Vec<&str>,&Vec<&str>,&Vec<&str>)) -> usize {
+    let mut dependency:usize = 0;
+    if dependencies.0.len() > 0 {
+        dependency += dependencies.0.len() - 1;
+    }
+    if dependencies.1.len() > 0 {
+        dependency += dependencies.1.len() - 1;
+    }
+    if dependencies.2.len() > 0 {
+        dependency += dependencies.2.len() - 1;
+    }
+    if dependencies.3.len() > 0 {
+        dependency += dependencies.3.len() -1;
+    }
+    if dependencies.4.len() > 0 {
+        dependency += dependencies.4.len() - 1;
+    }
+    if dependencies.5.len() > 0 {
+        dependency += dependencies.5.len() - 1;
+    }
+    dependency
+}
+fn is_module (relative_file_dir: &str) -> bool {
+    if(relative_file_dir.contains("./") || relative_file_dir.contains("../")){
+        return  false;
+    }
+    return true;
+}
+fn is_component (mut module_name: &str, file_name: &str, relative_file_path: &str, relative_file_dir: &str, content: &str) -> bool {
+    if(module_name.contains("as")){
+        module_name = module_name.split("as").nth(0).unwrap().trim();
+    }
     let print_status = module_name == "ProfileOptions";
     let mut return_value = true;
-    let component_usage_identifier = Regex::new(format!(r".*<{module_name}").as_str()).unwrap();
+    // let component_usage_identifier = Regex::new(format!(r".*<{module_name}").as_str()).unwrap();
     if module_name == "" || relative_file_path == "" {
-        if(print_status){
-            println!("Became False in the 1");
-        }
         return_value = false
     }
     else if !relative_file_dir.contains("./") && !relative_file_dir.contains("../") {
-        if(print_status){
-            println!("Became False in the 2");
-        }
         return_value = false
     }
-    else if(file_name.contains(".")){
+    else if file_name.contains(".") {
         if !file_name.contains(".js") && !file_name.contains(".jsx") && !file_name.contains(".ts") && !file_name.contains(".tsx"){
-            if(print_status){
-                println!("Became False in the 3");
-            }
             return_value = false
         }
     }
-    else if  !component_usage_identifier.is_match(content) {
-        if(print_status){
-            println!("Became False in the 4");
-        }
-        return_value = false
-    }
+    // else if  !component_usage_identifier.is_match(content) {
+    //     return_value = false
+    // }
     else if(!starts_with_capital_letter(module_name)){
-        if(print_status){
-            println!("Became False in the 5");
-        }
         return_value = false
     }
     
     return_value
+}
+fn path_contains_extension(relative_file_path: &str) -> bool {
+    let last_5_chars = &relative_file_path[relative_file_path.len() - 5 .. relative_file_path.len()];
+    if(last_5_chars.contains(".")){
+        return true;
+    }
+    false
 }
 fn get_module_path_from_directory(path: &Path, module_name: &str) -> Option<(String, String, String)>{
     let (file_name, found) = get_file_name("index", path);
@@ -184,12 +207,12 @@ fn get_file_name(name: &str, dir_path: &Path) -> (String, bool){
 fn get_module_name_and_path_from_line(line: &str, curly_braces: bool) -> (String, String, String, String) {
     let (relative_file_path, relative_file_dir, file_name) = get_file_paths(line);
     if curly_braces {
-        let module_name = find_string_in_between(line, "{", "}").unwrap_or("").trim();
-        (module_name.to_owned(), file_name, relative_file_path, relative_file_dir)
+        let module_names = find_string_in_between(line, "{", "}").unwrap_or("").trim();
+        (module_names.to_owned(), file_name, relative_file_path, relative_file_dir)
     }
     else{
-        let module_names = find_string_in_between(line, "import", "from").unwrap_or("").trim();
-        (module_names.to_owned(), file_name, relative_file_path, relative_file_dir)
+        let module_name = find_string_in_between(line, "import", "from").unwrap_or("").trim();
+        (module_name.to_owned(), file_name, relative_file_path, relative_file_dir)
     }
     
 }
@@ -259,15 +282,4 @@ pub fn search<'a>(query: &str, contents: &Vec<&'a str>, not: bool) -> Vec<&'a st
         }
     }
     results
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_result() {
-        let stufss = get_module_name_and_path_from_line("import Navbar from './components/shared/Navbar/Navbar';", false);
-        assert_eq!(true, true);
-    }
 }
